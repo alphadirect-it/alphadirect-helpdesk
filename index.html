@@ -7,7 +7,7 @@
 <script src="https://alcdn.msauth.net/browser/2.38.0/js/msal-browser.min.js"></script>
 <style>
   :root{
-    --navy:#0D1B2A;
+    --navy:#0D1B2A;h
     --navy-2:#1B263B;
     --navy-3:#243447;
     --orange:#F4A623;
@@ -488,12 +488,67 @@ function signOut() {
 // ============================================================
 
 async function fetchTickets() {
-  // Returns array of items with fields expanded, paginated across all pages.
-  // Microsoft Graph paginates at ~100 items per page regardless of $top.
+  // Fetches ALL list items via SharePoint REST API, which bypasses the list's
+  // item-level read permission (ReadSecurity=2) that restricts the Graph API endpoint.
+  const allRawItems = [];
+
+  // Acquire a SharePoint-scoped token
+  let spToken;
+  try {
+    const accounts = msalInstance.getAllAccounts();
+    const result = await msalInstance.acquireTokenSilent({
+      scopes: [`https://${CONFIG.sharepointHost}/.default`],
+      account: accounts[0]
+    });
+    spToken = result.accessToken;
+  } catch (e) {
+    console.error('Failed to get SharePoint token, falling back to Graph:', e);
+    return fetchTicketsViaGraph();
+  }
+
+  const selectFields = 'Id,TicketID,Title,Description,Category,Priority,Status,Department,RequesterLookupId,AssignedToLookupId,SLAHours,FirstResponseAt,ResolvedAt,Created,Modified,BreachNotified,Comments';
+  let nextUrl = `https://${CONFIG.sharepointHost}${CONFIG.sitePath}/_api/lists/getbytitle('${encodeURIComponent(CONFIG.listName)}')/items?$select=${selectFields}&$top=500&$orderby=Created%20asc`;
+
+  while (nextUrl) {
+    const resp = await fetch(nextUrl, {
+      headers: {
+        'Authorization': `Bearer ${spToken}`,
+        'Accept': 'application/json;odata=nometadata'
+      }
+    });
+    if (!resp.ok) {
+      const errText = await resp.text();
+      console.error('SharePoint REST error:', resp.status, errText);
+      return fetchTicketsViaGraph();
+    }
+    const data = await resp.json();
+    if (data.value) allRawItems.push(...data.value);
+    nextUrl = data['odata.nextLink'] || null;
+  }
+
+  console.log(`fetchTickets (REST): loaded ${allRawItems.length} items`);
+
+  // Wrap REST items to match the Graph API shape that normalizeTicket expects:
+  // Graph: { id, createdDateTime, lastModifiedDateTime, fields: { Title, Status, ... } }
+  // REST:  { Id, Created, Modified, Title, Status, ... }
+  const wrappedItems = allRawItems.map(item => ({
+    id: String(item.Id),
+    createdDateTime: item.Created,
+    lastModifiedDateTime: item.Modified,
+    fields: item
+  }));
+
+  const tickets = wrappedItems.map(item => normalizeTicket(item));
+  await resolvePersonFields(tickets);
+  return tickets;
+}
+
+async function fetchTicketsViaGraph() {
+  // Original Graph-based fetch (limited by SharePoint item-level permissions)
   const allItems = [];
   let url = `/sites/${state.siteId}/lists/${state.listId}/items?$expand=fields&$top=100`;
   let pageCount = 0;
-  const MAX_PAGES = 50; // safety net — 50 pages = 5000 tickets
+  const MAX_PAGES = 50;
 
   while (url && pageCount < MAX_PAGES) {
     const result = await callGraph(url);
@@ -504,21 +559,12 @@ async function fetchTickets() {
     pageCount++;
   }
 
-  console.log(`fetchTickets: loaded ${allItems.length} items across ${pageCount} page(s)`);
+  console.log(`fetchTicketsViaGraph: loaded ${allItems.length} items across ${pageCount} page(s)`);
 
   const tickets = allItems.map(item => normalizeTicket(item));
-
-  // Resolve missing Person field display names via the User Information List
   await resolvePersonFields(tickets);
-
   return tickets;
 }
-
-// Cache for SharePoint user lookups (lookupId -> {name, email})
-const userCache = new Map();
-let userListId = null;
-let userInfoListBootstrapped = false;
-
 async function findUserInformationListId() {
   if (userListId) return userListId;
   // Try common names for the user info list
